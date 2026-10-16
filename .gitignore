@@ -56,3 +56,11 @@
 /libavfilter/vulkan/*.c
 /.*/
 !/.forgejo/
+!/.github/
+/builder/
+/debian/
+/msys2/
+/Dockerfile*
+/docker-build.sh
+/build
+/build-*

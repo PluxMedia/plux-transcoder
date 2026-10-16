@@ -1,0 +1,369 @@
+name: '🏗️ Plux Transcoder 18-Asset Release Pipeline (Jellyfin Architecture)'
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'n*'
+      - 'v*'
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ===========================================================================
+  # 0. INITIALIZE & SYNC RELEASE (Pre-populate with already built assets)
+  # ===========================================================================
+  init_and_sync_release:
+    name: '🎯 Initialize & Sync Release'
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Release Exists and Recover Existing Artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME:-9.1-1}"
+          echo "Target Release Tag: ${TAG}"
+
+          # 1. Create release if it doesn't exist
+          if ! gh release view "${TAG}" &>/dev/null; then
+            echo "Creating initial release ${TAG}..."
+            gh release create "${TAG}" \
+              --title "Plux Transcoder ${TAG}" \
+              --notes "High-performance next-generation standalone transcoding engine built by PluxMedia." \
+              --prerelease=false
+          fi
+
+  # ===========================================================================
+  # 1. PORTABLE LINUX (linux64 and linuxarm64) -> 2 Assets
+  # ===========================================================================
+  build_portable_linux:
+    name: 'Build Portable Linux (${{ matrix.arch }})'
+    needs: init_and_sync_release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: linux64
+            pkg_name: portable_linux64-gpl
+          - os: ubuntu-24.04-arm
+            arch: linuxarm64
+            pkg_name: portable_linuxarm64-gpl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Release Filename
+        run: |
+          TAG="${GITHUB_REF_NAME:-9.1-1}"
+          RAW_VER=$(echo "${TAG}" | sed -E 's/^[nv]//')
+          [[ "${RAW_VER}" =~ ^[0-9]+\.[0-9]+$ ]] && VER="${RAW_VER}-1" || VER="${RAW_VER}"
+          echo "VER=${VER}" >> $GITHUB_ENV
+          TARGET_FILE="plux-transcoder_${VER}_${{ matrix.pkg_name }}.tar.xz"
+          echo "TARGET_FILE=${TARGET_FILE}" >> $GITHUB_ENV
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            autoconf automake build-essential cmake git libtool pkg-config \
+            texinfo yasm nasm ninja-build meson xz-utils \
+            libnuma-dev libass-dev libfreetype6-dev \
+            libvorbis-dev libssl-dev libwebp-dev libdrm-dev libfribidi-dev \
+            libharfbuzz-dev libfontconfig1-dev libxml2-dev libzimg-dev
+
+      - name: Build
+        run: |
+          chmod +x ./setup_plux_env.sh ./fetch_dependencies.sh ./build_plux.sh
+          ./build_plux.sh
+
+      - name: Package
+        run: |
+          mkdir -p package/bin
+          cp -a "dist/bin/Plux Transcoder" package/bin/
+          cp -a dist/bin/plux-transcoder package/bin/ 2>/dev/null || true
+          cp README.md package/
+          tar -cJf "${TARGET_FILE}" -C package .
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" "${TARGET_FILE}" --clobber
+
+  # ===========================================================================
+  # 2. PORTABLE WINDOWS (win64 and winarm64) -> 2 Assets
+  # ===========================================================================
+  build_portable_windows:
+    name: 'Build Portable Windows (${{ matrix.arch }})'
+    needs: init_and_sync_release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: win64
+            msystem: MINGW64
+            pkg_name: portable_win64-clang-gpl
+          - os: windows-11-arm
+            arch: winarm64
+            msystem: CLANGARM64
+            pkg_name: portable_winarm64-clang-gpl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set Release Filename
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-9.1-1}"
+          RAW_VER=$(echo "${TAG}" | sed -E 's/^[nv]//')
+          [[ "${RAW_VER}" =~ ^[0-9]+\.[0-9]+$ ]] && VER="${RAW_VER}-1" || VER="${RAW_VER}"
+          echo "VER=${VER}" >> $GITHUB_ENV
+          TARGET_FILE="plux-transcoder_${VER}_${{ matrix.pkg_name }}.zip"
+          echo "TARGET_FILE=${TARGET_FILE}" >> $GITHUB_ENV
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          path-type: minimal
+          msystem: ${{ matrix.msystem }}
+          install: >-
+            git
+            curl
+            tar
+            zip
+            unzip
+            make
+            autoconf
+            automake
+            libtool
+
+      - name: Install MSYS2 Toolchain and Build Tools
+        shell: msys2 {0}
+        run: |
+          pacman -S --noconfirm --needed \
+            ${MINGW_PACKAGE_PREFIX}-toolchain \
+            ${MINGW_PACKAGE_PREFIX}-cmake \
+            ${MINGW_PACKAGE_PREFIX}-ninja \
+            ${MINGW_PACKAGE_PREFIX}-meson \
+            ${MINGW_PACKAGE_PREFIX}-nasm \
+            ${MINGW_PACKAGE_PREFIX}-pkgconf || true
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          chmod +x ./setup_plux_env.sh ./fetch_dependencies.sh ./build_plux.sh
+          ./build_plux.sh
+
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          mkdir -p package/bin
+          cp -a "dist/bin/Plux Transcoder.exe" package/bin/ 2>/dev/null || cp -a dist/bin/*.exe package/bin/ 2>/dev/null || true
+          cp -a dist/bin/plux-transcoder.exe package/bin/ 2>/dev/null || true
+          cp README.md package/
+          zip -r "${TARGET_FILE}" package/
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" "${TARGET_FILE}" --clobber
+
+  # ===========================================================================
+  # 3. PORTABLE MACOS (mac64 and macarm64) -> 2 Assets
+  # ===========================================================================
+  build_portable_mac:
+    name: 'Build Portable macOS (${{ matrix.arch }})'
+    needs: init_and_sync_release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: macarm64
+            pkg_name: portable_macarm64-gpl
+          - os: macos-15-intel
+            arch: mac64
+            pkg_name: portable_mac64-gpl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Release Filename
+        run: |
+          TAG="${GITHUB_REF_NAME:-9.1-1}"
+          RAW_VER=$(echo "${TAG}" | sed -E 's/^[nv]//')
+          [[ "${RAW_VER}" =~ ^[0-9]+\.[0-9]+$ ]] && VER="${RAW_VER}-1" || VER="${RAW_VER}"
+          echo "VER=${VER}" >> $GITHUB_ENV
+          TARGET_FILE="plux-transcoder_${VER}_${{ matrix.pkg_name }}.tar.xz"
+          echo "TARGET_FILE=${TARGET_FILE}" >> $GITHUB_ENV
+
+      - name: Install macOS Dependencies
+        run: |
+          brew install autoconf automake libtool cmake ninja meson nasm pkg-config x264 x265 xz \
+            zimg freetype fontconfig fribidi harfbuzz libass libvorbis openssl webp
+
+      - name: Build
+        run: |
+          chmod +x ./setup_plux_env.sh ./fetch_dependencies.sh ./build_plux.sh
+          ./build_plux.sh
+
+      - name: Package
+        run: |
+          mkdir -p package/bin
+          cp -a "dist/bin/Plux Transcoder" package/bin/
+          cp -a dist/bin/plux-transcoder package/bin/ 2>/dev/null || true
+          cp README.md package/
+          tar -cJf "${TARGET_FILE}" -C package .
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" "${TARGET_FILE}" --clobber
+
+  # ===========================================================================
+  # 4. DEBIAN & UBUNTU NATIVE DEB PACKAGES (10 Distros/Arches) -> 10 Assets
+  # ===========================================================================
+  build_deb_packages:
+    name: 'Build DEB (${{ matrix.codename }} ${{ matrix.arch }})'
+    needs: init_and_sync_release
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Debian Bookworm (12)
+          - distro: debian
+            codename: bookworm
+            arch: amd64
+          - distro: debian
+            codename: bookworm
+            arch: arm64
+          # Debian Trixie (13)
+          - distro: debian
+            codename: trixie
+            arch: amd64
+          - distro: debian
+            codename: trixie
+            arch: arm64
+          # Ubuntu Jammy (22.04)
+          - distro: ubuntu
+            codename: jammy
+            arch: amd64
+          - distro: ubuntu
+            codename: jammy
+            arch: arm64
+          # Ubuntu Noble (24.04)
+          - distro: ubuntu
+            codename: noble
+            arch: amd64
+          - distro: ubuntu
+            codename: noble
+            arch: arm64
+          # Ubuntu Resolute (24.10)
+          - distro: ubuntu
+            codename: resolute
+            arch: amd64
+          - distro: ubuntu
+            codename: resolute
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Release Filename
+        run: |
+          TAG="${GITHUB_REF_NAME:-9.1-1}"
+          RAW_VER=$(echo "${TAG}" | sed -E 's/^[nv]//')
+          [[ "${RAW_VER}" =~ ^[0-9]+\.[0-9]+$ ]] && VER="${RAW_VER}-1" || VER="${RAW_VER}"
+          echo "VER=${VER}" >> $GITHUB_ENV
+          PKG_NAME="plux-transcoder_${VER}-${{ matrix.codename }}_${{ matrix.arch }}"
+          TARGET_FILE="${PKG_NAME}.deb"
+          echo "TARGET_FILE=${TARGET_FILE}" >> $GITHUB_ENV
+          echo "PKG_NAME=${PKG_NAME}" >> $GITHUB_ENV
+
+      - name: Install Build Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            autoconf automake libtool build-essential \
+            debhelper dpkg-dev pkg-config cmake ninja-build meson yasm nasm \
+            libnuma-dev libass-dev libfreetype6-dev \
+            libvorbis-dev libssl-dev libwebp-dev libdrm-dev libfribidi-dev \
+            libharfbuzz-dev libfontconfig1-dev libxml2-dev libzimg-dev
+
+      - name: Build Plux Transcoder
+        run: |
+          chmod +x ./setup_plux_env.sh ./fetch_dependencies.sh ./build_plux.sh
+          ./build_plux.sh
+
+      - name: Package Native DEB
+        run: |
+          mkdir -p "${PKG_NAME}/usr/lib/plux-transcoder/bin"
+          mkdir -p "${PKG_NAME}/usr/bin"
+          mkdir -p "${PKG_NAME}/DEBIAN"
+          cp -a "dist/bin/Plux Transcoder" "${PKG_NAME}/usr/lib/plux-transcoder/bin/"
+          ln -sf "/usr/lib/plux-transcoder/bin/Plux Transcoder" "${PKG_NAME}/usr/bin/plux-transcoder"
+          printf "%s\n" \
+            "Package: plux-transcoder" \
+            "Version: ${VER}" \
+            "Architecture: ${{ matrix.arch }}" \
+            "Maintainer: PluxMedia Team <https://github.com/PluxMedia>" \
+            "Section: video" \
+            "Priority: optional" \
+            "Description: Plux Transcoder - High-performance next-generation transcoding engine" \
+            " Enhanced FFmpeg tree with H.266/VVC, Dolby Vision Profiles 5/7/8, and xHE-AAC." \
+            > "${PKG_NAME}/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "${PKG_NAME}"
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" "${TARGET_FILE}" --clobber
+
+  # ===========================================================================
+  # 5. FINALIZE RELEASE (Verify all 18 Assets)
+  # ===========================================================================
+  finalize_release:
+    name: '🎉 Finalize & Verify Release (18 Assets)'
+    needs:
+      - build_portable_linux
+      - build_portable_windows
+      - build_portable_mac
+      - build_deb_packages
+    if: always() && !cancelled() && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Summary of Release Assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME:-9.1-1}"
+          echo "=== OFFICIAL RELEASE ASSETS FOR ${TAG} ==="
+          gh release view "${TAG}" --json assets -q '.assets[].name'
+          ASSET_COUNT=$(gh release view "${TAG}" --json assets -q '.assets | length')
+          echo "Total compiled assets published: ${ASSET_COUNT}"
+          echo "Plus 2 source code archives automatically generated by GitHub."
